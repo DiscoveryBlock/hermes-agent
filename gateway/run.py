@@ -9399,7 +9399,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
         for platform, adapter in list(self.adapters.items()):
-            home = self.config.get_home_channel(platform)
+            home = self._lifecycle_home_channel(
+                platform, self.config.get_home_channel(platform)
+            )
             if not home or not home.chat_id:
                 continue
 
@@ -21247,6 +21249,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             notify_path.unlink(missing_ok=True)
 
+    def _lifecycle_home_channel(
+        self,
+        platform,
+        home,
+    ):
+        """Destination for gateway lifecycle (shutdown/startup) broadcasts.
+
+        On Matrix these routine restart/shutdown pings go to the dedicated
+        "Kira | Updates" room instead of the home channel (the Brian<->Kira
+        DM), so lifecycle noise lands with the other automated updates rather
+        than cluttering the DM. Override or disable via the
+        MATRIX_LIFECYCLE_ROOM_ID env var ("" keeps the home channel). Other
+        platforms and other (non-lifecycle) uses of the home channel are
+        unaffected.
+        """
+        if getattr(platform, "value", platform) == "matrix":
+            room = os.environ.get(
+                "MATRIX_LIFECYCLE_ROOM_ID", "!nhaEKYoecFPjUfNWdU:kira.local"
+            )
+            if room:
+                return HomeChannel(
+                    platform=platform,
+                    chat_id=room,
+                    name="Kira | Updates",
+                )
+        return home
+
     async def _send_home_channel_startup_notifications(
         self,
         *,
@@ -21263,7 +21292,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, platform_cfg in self.config.platforms.items():
-            home = platform_cfg.home_channel
+            home = self._lifecycle_home_channel(platform, platform_cfg.home_channel)
             if not home or not home.chat_id:
                 continue
 
