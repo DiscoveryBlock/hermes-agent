@@ -4794,12 +4794,14 @@ class MatrixAdapter(BasePlatformAdapter):
             return False
         if self._user_id and self._user_id in body:
             return True
-        if self._user_id and ":" in self._user_id:
-            localpart = self._user_id.split(":")[0].lstrip("@")
-            if localpart and re.search(
-                r"\b" + re.escape(localpart) + r"\b", body, re.IGNORECASE
-            ):
-                return True
+        # KIRA_MENTION_PILL_ONLY: bare-word "kira" matching is DISABLED. The bot is
+        # named "kira" and the homeserver is "kira.local", so that token appears
+        # incidentally where it must NOT count as an address: "kira.local" inside
+        # every @user pill, the "Kira Agent" bookmark category in Claude's daily
+        # briefing, third-person references. Rely on AUTHORITATIVE signals only:
+        # m.mentions.user_ids (above), the full @kira:server MXID in body (above),
+        # and the matrix.to/@kira pill link (below). To reach Kira in a shared room,
+        # PILL @kira — plain-text "kira" no longer triggers a response.
         if formatted_body and self._user_id:
             if f"matrix.to/#/{self._user_id}" in formatted_body:
                 return True
