@@ -2103,6 +2103,61 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
         )
+        # KIRA_FALLBACK_EVENT_LOG_PATCHED -- durable, greppable fallback record.
+        # Hermes' logger.info above is transient/rotated; append a JSONL line
+        # (+ deduped Telegram ping) the instant the primary drops to a fallback,
+        # so we catch it live instead of guessing from Kira's self-reports.
+        # Fully guarded: any failure here must never break the fallback swap.
+        try:
+            import json as _fbj, time as _fbt, os as _fbo, urllib.parse as _fbup, urllib.request as _fbur
+            _fb_reason = getattr(reason, "value", None) or (str(reason) if reason else "unknown")
+            _fb_dir = _fbo.path.expanduser("~/morpheus/data/logs")
+            _fbo.makedirs(_fb_dir, exist_ok=True)
+            _fb_rec = {
+                "ts": _fbt.strftime("%Y-%m-%dT%H:%M:%S"),
+                "epoch": round(_fbt.time(), 3),
+                "event": "fallback_activated",
+                "from_model": old_model, "from_provider": old_provider,
+                "to_model": fb_model, "to_provider": fb_provider,
+                "reason": _fb_reason,
+                "fallback_index": getattr(agent, "_fallback_index", None),
+            }
+            with open(_fbo.path.join(_fb_dir, "fallback-events.jsonl"), "a") as _fbfh:
+                _fbfh.write(_fbj.dumps(_fb_rec) + "\n")
+            logger.warning("[FALLBACK_EVENT] FELL BACK: %s/%s -> %s/%s (reason=%s)",
+                           old_provider, old_model, fb_provider, fb_model, _fb_reason)
+            # Deduped Telegram ping (<=1 / 30 min): chain-walk + repeated turns
+            # while primary is down would otherwise flood. Same env file the
+            # proxy trusted-provider gate uses.
+            _fb_sentinel = _fbo.path.join(_fb_dir, ".fallback-alert-sent")
+            try:
+                _fb_recent = (_fbt.time() - _fbo.path.getmtime(_fb_sentinel)) < 1800
+            except OSError:
+                _fb_recent = False
+            if not _fb_recent:
+                _fb_env = {}
+                _fb_ap = _fbo.path.expanduser("~/.hermes/.alerting-env")
+                if _fbo.path.exists(_fb_ap):
+                    for _ln in open(_fb_ap):
+                        _ln = _ln.strip()
+                        if _ln and not _ln.startswith("#") and "=" in _ln:
+                            _k, _, _v = _ln.partition("=")
+                            _fb_env[_k.strip()] = _v.strip().strip('"').strip("'")
+                _fb_tok = _fb_env.get("TELEGRAM_BOT_TOKEN"); _fb_chat = _fb_env.get("TELEGRAM_CHAT_ID")
+                if _fb_tok and _fb_chat:
+                    _fb_txt = ("Kira FELL BACK to fallback inference: %s (%s) -> %s (%s). "
+                               "Reason: %s. Primary Morpheus P2P inference dropped."
+                               % (old_model, old_provider, fb_model, fb_provider, _fb_reason))
+                    _fb_body = _fbup.urlencode({"chat_id": _fb_chat, "text": _fb_txt,
+                                                "disable_web_page_preview": "true"}).encode()
+                    _fbur.urlopen("https://api.telegram.org/bot%s/sendMessage" % _fb_tok,
+                                  data=_fb_body, timeout=10)
+                    open(_fb_sentinel, "a").close(); _fbo.utime(_fb_sentinel, None)
+        except Exception as _fb_exc:
+            try:
+                logger.debug("fallback-event logging failed: %s", _fb_exc)
+            except Exception:
+                pass
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the OLD provider's unresponsiveness.  Carrying it over would
         # short-circuit the freshly activated fallback before it gets a
