@@ -464,6 +464,29 @@ def finalize_turn(
     else:
         logger.info(_diag_msg, *_diag_args)
 
+    # KIRA_TURN_HEARTBEAT_PATCHED -- completed-work liveness (silent-outage skill).
+    # Placed AFTER the whole Turn-ended if/else so EVERY finalized turn
+    # heartbeats, including warning-branch (pending-tool-result) turns.
+    # Fully guarded: a failure here must never break a turn.
+    try:
+        import json as _thj, os as _tho, tempfile as _tht, time as _thtime
+        _th_dir = _tho.path.expanduser("~/.hermes/state")
+        _tho.makedirs(_th_dir, exist_ok=True)
+        _th_fd, _th_tmpname = _tht.mkstemp(dir=_th_dir, prefix=".turn-hb.", suffix=".tmp")
+        with _tho.fdopen(_th_fd, "w") as _th_fh:
+            _thj.dump({
+                "timestamp": _thtime.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "session": agent.session_id or "none",
+                "reason": _turn_exit_reason,
+                "model": agent.model,
+            }, _th_fh)
+        _tho.replace(_th_tmpname, _tho.path.join(_th_dir, "turn-heartbeat.json"))
+    except Exception as _th_exc:
+        try:
+            logger.debug("turn-heartbeat write failed: %s", _th_exc)
+        except Exception:
+            pass
+
     # File-mutation verifier footer.
     # If one or more ``write_file`` / ``patch`` calls failed during this
     # turn and were never superseded by a successful write to the same
