@@ -726,6 +726,57 @@ def _resolve_e2ee_mode(extra: Optional[Dict[str, Any]] = None) -> str:
     return "required" if legacy_enabled else "off"
 
 
+
+# KIRA_SILENCE_REFUSAL_FILTER: outbound silence-narration detection.
+# Start-anchored openers, tail-anchored declarations, and (for short messages
+# only) unambiguous self-referential phrases that never occur in a genuine
+# answer. Bare marker-tag-only bodies (e.g. "<zwat></zwat>") also count.
+_KIRA_SILENCE_START_RE = re.compile(
+    r"^\s*(?:"
+    r"\[?(?:intentional\s*)?silen(?:ce|t)\]?[.!]?\s*$"
+    r"|(?:<[a-zA-Z_][\w-]*\s*/?>\s*)+(?:</[a-zA-Z_][\w-]*>\s*)*$"
+    r"|I['\u2019]?m not respond"
+    r"|Not responding[.!]?\s*$"
+    r"|Staying (?:completely )?silent"
+    r"|(?:Complete|Total) silence"
+    r"|Zero (?:response|characters)[.!]?\s*$"
+    r"|Sending zero characters"
+    r"|Remaining silent"
+    r"|No response (?:needed|required|sent|from me)"
+    r"|Standing by[.!]?\s*$"
+    r")",
+    re.IGNORECASE,
+)
+_KIRA_SILENCE_TAIL_RE = re.compile(
+    r"(?:Staying (?:completely )?silent|Sending zero characters"
+    r"|remain(?:ing)? silent"
+    r"|No response (?:needed|required|sent))[.!]?\s*$",
+    re.IGNORECASE,
+)
+_KIRA_SILENCE_ANY_RE = re.compile(
+    r"no @?kira pill"
+    r"|not addressed to me"
+    r"|not meant for me"
+    r"|sending zero characters"
+    r"|\bI['\u2019]?ll (?:stay|remain) (?:silent|quiet)",
+    re.IGNORECASE,
+)
+
+
+def _kira_is_silence_narration(text):
+    """True when outbound text only narrates a decision not to respond."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    if _KIRA_SILENCE_START_RE.match(stripped):
+        return True
+    if _KIRA_SILENCE_TAIL_RE.search(stripped[-200:]):
+        return True
+    if len(stripped) <= 500 and _KIRA_SILENCE_ANY_RE.search(stripped):
+        return True
+    return False
+
+
 def _redact_matrix_value(value: Any) -> str:
     """Return a safe, non-reversible preview for Matrix diagnostics."""
     text = str(value or "").strip()
@@ -2096,6 +2147,20 @@ class MatrixAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=True)
 
+        # KIRA_SILENCE_REFUSAL_FILTER (designed 2026-06, applied 2026-07-20):
+        # a narrated non-response must not reach the room — it re-triggers
+        # the other agent. Drop it here and report success so the agent loop
+        # treats the turn as done.
+        if _kira_is_silence_narration(content):
+            logger.info(
+                "Matrix: KIRA_SILENCE_REFUSAL_FILTER suppressed a silence "
+                "narration to %s (%d chars): %.120s",
+                chat_id,
+                len(content),
+                content.replace("\n", " "),
+            )
+            return SendResult(success=True)
+
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.max_message_length)
 
@@ -3288,6 +3353,43 @@ class MatrixAdapter(BasePlatformAdapter):
                 return None
 
             is_free_room = room_id in self._free_rooms
+            # KIRA_FREE_ROOM_BOT_GATE: "free response" means free response to
+            # HUMANS. In a shared room another agent also occupies, the free-
+            # room bypass must not make this bot process (a) other bots'
+            # posts or (b) messages explicitly pilled to a different agent —
+            # both fed the 2026-07-20 SuperConnector silence-narration loop.
+            # An explicit @kira mention still passes either gate.
+            if is_free_room and not is_mentioned:
+                _known_bots = {
+                    p.strip()
+                    for p in os.getenv(
+                        "MATRIX_KNOWN_BOTS",
+                        "@claude:kira.local,@hermes-alerter:kira.local,"
+                        "@superconnector:kira.local",
+                    ).split(",")
+                    if p.strip()
+                }
+                if sender in _known_bots:
+                    logger.info(
+                        "Matrix: KIRA_FREE_ROOM_BOT_GATE ignoring bot message "
+                        "%s from %s in free room %s (no @mention)",
+                        event_id,
+                        sender,
+                        room_id,
+                    )
+                    return None
+                _pilled_bots = {
+                    uid for uid in (mention_user_ids or []) if uid in _known_bots
+                }
+                if _pilled_bots:
+                    logger.info(
+                        "Matrix: KIRA_FREE_ROOM_BOT_GATE ignoring message %s "
+                        "in free room %s — pilled to %s, not to me",
+                        event_id,
+                        room_id,
+                        ",".join(sorted(_pilled_bots)),
+                    )
+                    return None
             in_bot_thread = bool(thread_id and thread_id in self._threads)
             is_command = body.startswith("/")
             if self._require_mention and not is_free_room and not in_bot_thread:
