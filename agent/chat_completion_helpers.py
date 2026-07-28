@@ -1157,6 +1157,42 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
+    # KIRA_WALL_CLOCK_TIME_PATCHED -- per-turn wall-clock grounding
+    # (cross-agent rule 2026-07-22: "Ground yourself in real wall-clock
+    # time"). Appends the current America/Puerto_Rico time to the outbound
+    # system message, fresh on every API attempt. Copy-on-write: the caller's
+    # api_messages and persisted history are never mutated, so stamps cannot
+    # accumulate or go stale. Minute resolution on purpose: keeps the system
+    # prompt byte-stable across the rapid calls of a multi-tool turn so
+    # provider-side prefix/KV caches stay warm within the minute. ASCII-only
+    # text (survives the force-ascii sanitizer). Fully guarded: a failure
+    # here must never break a turn.
+    try:
+        if (
+            api_messages
+            and isinstance(api_messages[0], dict)
+            and api_messages[0].get("role") == "system"
+            and isinstance(api_messages[0].get("content"), str)
+        ):
+            from datetime import datetime as _wct_dt
+            try:
+                from zoneinfo import ZoneInfo as _wct_zi
+                _wct_now = _wct_dt.now(_wct_zi("America/Puerto_Rico"))
+            except Exception:
+                _wct_now = _wct_dt.now().astimezone()
+            _wct_line = (
+                "\n\n[Current wall-clock time: "
+                + _wct_now.strftime("%A %Y-%m-%d %H:%M %Z")
+                + " (America/Puerto_Rico). Injected mechanically by the"
+                " gateway on every model call and always current -- trust it"
+                " over any other time reference in this conversation; never"
+                " infer the current time from context.]"
+            )
+            _wct_sys = dict(api_messages[0])
+            _wct_sys["content"] = _wct_sys["content"] + _wct_line
+            api_messages = [_wct_sys] + list(api_messages[1:])
+    except Exception:
+        pass
     if tools_for_api is None:
         tools_for_api = agent.tools
 
