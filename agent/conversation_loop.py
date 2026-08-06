@@ -1412,7 +1412,27 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    # KIRA_LOOP_GUARDS_PATCHED -- stuck-detection + checkpoint-continue (Brian 2026-07-20).
+    # Guarded import, deliberately function-local: the module import block is the one
+    # part of this file a lint sweep touches (upstream 5b751dc0a deleted the old
+    # module-level anchor), and a call-time import cannot hit a circular import.
+    # If loop_guards is missing/broken, fall back to EXACT original loop behavior via
+    # stubs, so a broken guard can never take Kira down.
+    try:
+        from agent.loop_guards import (
+            init_state as _loop_guards_init_state,
+            should_continue as _loop_guard_should_continue,
+            record_tools as _loop_guard_record_tools,
+        )
+    except Exception:
+        def _loop_guards_init_state(agent):
+            return None
+        def _loop_guard_should_continue(agent, api_call_count, messages, state):
+            return (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call
+        def _loop_guard_record_tools(agent, messages, pre_len, assistant_message, state):
+            return "proceed"
+    _lg_state = _loop_guards_init_state(agent)  # KIRA_LOOP_GUARDS_PATCHED (None => original behavior)
+    while _loop_guard_should_continue(agent, api_call_count, messages, _lg_state):
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -6362,7 +6382,13 @@ def run_conversation(
                     except Exception:
                         pass
 
+                _lg_pre_len = len(messages)  # KIRA_LOOP_GUARDS_PATCHED
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                if _lg_state is not None and _loop_guard_record_tools(agent, messages, _lg_pre_len, assistant_message, _lg_state) == "escalate":
+                    _turn_exit_reason = "loop_guard_stuck_escalated"
+                    final_response = _lg_state.pending_handoff
+                    messages.append({"role": "assistant", "content": final_response})
+                    break
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send
@@ -7310,6 +7336,35 @@ def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
+    if _lg_state is not None and getattr(_lg_state, "pending_handoff", None) and final_response is None:  # KIRA_LOOP_GUARDS_PATCHED
+        final_response = _lg_state.pending_handoff
+        _turn_exit_reason = "loop_guard_escalated_ceiling"
+        messages.append({"role": "assistant", "content": final_response})
+    # KIRA_LOOP_GUARD_RECOVERY -- alert-then-clear contract (FC-2, 2026-07-31).
+    # When the guard was active and the turn completed without escalation,
+    # clear any stale kira-loop-guard alert key from a prior turn. Without
+    # this, the first escalation alert never clears and subsequent alerts
+    # post as "[STILL FAILING — occurrence #N]" forever. Silent no-op when
+    # the key isn't in alert-dedup.json. Returncode checked (FC-4).
+    if _lg_state is not None and not getattr(_lg_state, "_notified", False) and not getattr(_lg_state, "pending_handoff", None):
+        try:
+            import subprocess as _lg_subproc
+            from pathlib import Path as _lg_path
+            _lg_notify = _lg_path.home() / ".hermes" / "scripts" / "notify-alert.py"
+            if _lg_notify.exists():
+                _lg_rc = _lg_subproc.run(
+                    ["/usr/bin/python3", str(_lg_notify),
+                     "--key", "kira-loop-guard", "--recover",
+                     "--summary", "Kira loop guard: turn completed cleanly (no escalation)."],
+                    stdout=_lg_subproc.DEVNULL, stderr=_lg_subproc.DEVNULL,
+                    timeout=10,
+                ).returncode
+                if _lg_rc != 0:
+                    logging.getLogger(__name__).warning(
+                        "loop-guard recovery notify-alert exited rc=%d"
+                        " (key may not have been set — benign)", _lg_rc)
+        except Exception:
+            pass
     from agent.turn_finalizer import finalize_turn
     return finalize_turn(
         agent,
