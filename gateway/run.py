@@ -1918,6 +1918,7 @@ from contextlib import contextmanager as _contextmanager
 from gateway.config import (
     PORT_BINDING_PLATFORM_VALUES as _PORT_BINDING_PLATFORM_VALUES,
     platform_binds_port as _platform_binds_port,
+    HomeChannel,
 )
 
 
